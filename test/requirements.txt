@@ -1,0 +1,8 @@
+falcon
+webargs
+marshmallow
+python-gd-applogger
+boto3
+requests
+zeep
+python-dateutil<2.7.0

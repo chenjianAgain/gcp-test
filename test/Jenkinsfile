@@ -1,0 +1,326 @@
+#!groovy
+
+@Library('ECM@master') _
+
+pipeline {
+
+    agent{label 'master' }
+
+    options {
+        ansiColor('xterm')
+        timestamps()
+        timeout(time: 1, unit: 'HOURS')
+    }
+
+    environment {
+        YUM_REPO = 'oxprovisioning'
+        DOCKER_REPO = 'docker-emailnew-general-local.artifactory.secureserver.net'
+        UNITTEST_CONTAINER = 'cent7.python36.unittest:0.1.3'
+        CHATTER_SLACK_CHANNEL = '#email-ei-chatter'
+        // TEAM_SLACK_CHANNEL = '#email-infra-dev'
+        DEV_NULL_SLACK_CHANNEL = '#dev-null'
+        DOCKER_PYTHON_IMAGE = 'python:3.6.4-alpine3.6'
+        ARTIFACTORY_PYPI_REPO = 'emailnew-fenix-shared'
+    }
+
+    stages{
+        // Parse the commit and gather information
+        stage ('Stage #1 - Preparation'){
+            steps{
+                script {
+                    try{
+                        // Commit Data
+                        payloadObj = parse_payload(env.payload)
+                        service = payloadObj.repository.full_name
+                        is_tag = check_for_tag(payloadObj)
+                        author = payloadObj.pusher.name
+                        author_email = payloadObj.pusher.email
+                        commit = payloadObj.head_commit.id
+                        message = payloadObj.head_commit.message
+                        timestamp = payloadObj.head_commit.timestamp
+                        ref_parts = payloadObj.ref.split('/')
+                        if (is_tag) {
+                            build = ref_parts[ref_parts.length - 1]
+                            target_branch = "master"
+                        }
+                        else {
+                            build = commit
+                            target_branch = ref_parts[ref_parts.length - 1]
+                        }
+
+                        // Notification information
+                        slack_message = null
+                        slack_channel = env.CHATTER_SLACK_CHANNEL
+
+                        // Credentials
+                        effort_user = null
+                        effort_pass = null
+                        artifactory_user = null
+                        artifactory_pass = null
+                        withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                                                credentialsId: 'effort_artifactory_user',
+                                                usernameVariable: 'ARTIFACTORY_USERNAME',
+                                                passwordVariable: 'ARTIFACTORY_PASSWORD']]
+                        ) {
+                            artifactory_user = env.ARTIFACTORY_USERNAME
+                            artifactory_pass = env.ARTIFACTORY_PASSWORD
+                        }
+                        withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                                credentialsId: 'effort_service_account',
+                                usernameVariable: 'YUM_USERNAME',
+                                passwordVariable: 'YUM_PASSWORD']]
+                        ) {
+                            effort_user = env.YUM_USERNAME
+                            effort_pass = env.YUM_PASSWORD
+                        }
+
+                        // Check out the specific commit/build
+                        sh(
+                            returnStdout: false,
+                            script: """
+                                git checkout ${build}
+                            """
+                        )
+
+                        // Debug
+                        echo "Running pipeline for $target_branch : $build : \"$message\", pushed by $author ($author_email) at time $timestamp"
+
+                    } catch(Exception ex) {
+                        println ex
+                        throw ex
+                    }
+                }
+            }
+            post {
+                success {
+                    // show green checkmark
+                    echo "\u001B[32m Prepation Complete -\u001B[m \u2705"
+                }
+
+                failure {
+                    echo "\u001B[31m Preparation FAILED -\u001B[m \u274C"
+                }
+            }
+        }
+        // Always run unit tests, notify if they fail
+        stage ('Stage #2 - Unit Tests'){
+            when {
+                expression {target_branch == "master" || is_tag == true}
+            }
+            steps{
+                script {
+                    try{
+                        docker.withRegistry("https://${DOCKER_REPO}", 'effort_artifactory_user') {
+                            docker.image("${DOCKER_REPO}/${UNITTEST_CONTAINER}").inside(
+                                """
+                                    --volume ${WORKSPACE}:/tmp/application
+                                    --workdir /tmp/application
+                                """
+                            ){
+                                sh (
+                                    returnStdout: true,
+                                    script: """
+                                        pip3.6 install -r requirements.txt --user
+                                        ./run_tests.sh
+                                    """
+                                )
+                            }
+                        }
+                    } catch(Exception ex) {
+                        println ex
+                        throw ex
+                    }
+
+
+                }
+            }
+            post {
+                success {
+                    echo "\u001B[32m Unittests Complete -\u001B[m \u2705"
+                }
+                failure {
+                    echo "\u001B[31m Unittests FAILED -\u001B[m \u274C"
+                    sendNotifications(
+                        'FAILURE',
+                        "${slack_channel}",
+                        "\n*UNITTEST FAILURES!!*\nservice: ${service} build: `${build}`\n author: @${author}\n:boom:"
+                    )
+                }
+            }
+        }
+        stage ('Stage #3 - Upload to artifactory'){
+            // Only runs for a release (tag)
+            when {
+                expression {is_tag == true}
+            }
+            steps{
+                script{
+                    try{
+
+                        // Prepare pypirc and pip.conf files to artifactory upload
+                        sh (
+                            returnStdout: false,
+                            script: """
+                                #!/bin/sh -ex
+                                { set +x; } 2>/dev/null
+                                mkdir -p root_dir/.pip
+                                echo [distutils] > root_dir/.pypirc
+                                echo "index-servers = ${ARTIFACTORY_PYPI_REPO}" >> root_dir/.pypirc
+                                echo "[${ARTIFACTORY_PYPI_REPO}]" >> root_dir/.pypirc
+                                echo "repository: https://artifactory.secureserver.net/artifactory/api/pypi/pypi-${ARTIFACTORY_PYPI_REPO}-local" >> root_dir/.pypirc
+                                echo username: ${artifactory_user} >> root_dir/.pypirc
+                                echo password: ${artifactory_pass} >> root_dir/.pypirc; set -x;
+
+                                echo [global] > root_dir/.pip/pip.conf
+                                echo "extra-index-url = https://${artifactory_user}:${artifactory_pass}@artifactory.secureserver.net/artifactory/api/pypi/pypi-${ARTIFACTORY_PYPI_REPO}-local/simple" >> root_dir/.pip/pip.conf; set -x;
+
+                            """
+                        )
+
+                        // Build and upload to Pypi Artifactory from within container
+                        docker.image("${DOCKER_PYTHON_IMAGE}").inside(
+                            "--user root -v ${WORKSPACE}:/tmp -v ${WORKSPACE}/root_dir:/root -e MODULE_VERSION=${build}"
+                        ){
+                            sh (
+                                returnStdout: true,
+                                script: """
+                                    mkdir /build_dir
+                                    cp -a /tmp/. /build_dir/
+                                    cd /build_dir/
+                                    python setup.py sdist upload -r ${ARTIFACTORY_PYPI_REPO}
+                                """
+                            )
+                        }
+                    } catch(Exception ex) {
+                        println ex
+                        // rethrow to fail the step
+                        throw ex
+                    }
+                }
+
+            }
+            // Post can be used both on individual stages and for the entire build.
+            post {
+                success {
+                    echo "\u001B[32mPypi Upload Complete -\u001B[m \u2705"
+                }
+                failure {
+                    echo "\u001B[31mPypi Upload FAILED -\u001B[m \u274C"
+                    sendNotifications(
+                        'FAILURE',
+                        "${slack_channel}",
+                        "\n*PYPI UPLOAD FAILED*\nservice: ${service} build: `${build}`\n author: @${author}\n:boom:"
+                    )
+                }
+            }
+        }
+
+        stage ('Stage #4 - Upload RPM to dev/test'){
+            // Only runs for a release (tag)
+            when {
+                expression {is_tag == true}
+            }
+            steps{
+                script{
+                    try {
+                        // for now upload to dev and test. could be separate steps. could promote, but that breaks sometimes
+                        docker.image("registry.hub.docker.com/library/centos:latest").inside(
+                            """
+                                --user root
+                                --volume ${WORKSPACE}:/tmp/application
+                                --workdir /tmp
+                                --env YUM_USER=${effort_user}
+                                --env YUM_PASS=${effort_pass}
+                                --env YUM_REPO=${env.YUM_REPO}
+                            """
+                        ){
+                            sh (
+                                returnStdout: false,
+                                script: """
+                                    curl -o /etc/yum.repos.d/python36.repo https://yum.secureserver.net/api/v0.1/repos/dev/centos/7/x86_64/python36/repofile
+                                    yum update -y
+                                    yum install -y make rpm-build git python36u python36u-setuptools
+
+                                    cp -R /tmp/application /tmp/build
+                                    cd /tmp/build
+
+                                    make rpm
+                                    rpm -qip dist/RPMS/noarch/*.rpm
+
+                                    curl \
+                                        -u \${YUM_USER}:\${YUM_PASS} \
+                                        -X PUT \
+                                        --fail \
+                                        --verbose 2>/dev/null \
+                                        --write-out "Received a %{http_code} from DEV upload" \
+                                        -F packages=@./dist/RPMS/noarch/\$(basename dist/RPMS/noarch/*.rpm) \
+                                        https://yum.secureserver.net/api/v0.1/repos/dev/centos/7/x86_64/\${YUM_REPO}/upload
+
+                                    curl \
+                                        -u \${YUM_USER}:\${YUM_PASS} \
+                                        -X PUT \
+                                        --fail \
+                                        --verbose 2>/dev/null \
+                                        --write-out "Received a %{http_code} from TEST upload" \
+                                        -F packages=@./dist/RPMS/noarch/\$(basename dist/RPMS/noarch/*.rpm) \
+                                        https://yum.secureserver.net/api/v0.1/repos/test/centos/7/x86_64/\${YUM_REPO}/upload
+                                """
+                            )
+
+                            built_package_name = sh (
+                                returnStdout: true,
+                                script: """
+                                    rpm --queryformat "%{NAME}-%{VERSION}-%{RELEASE}" -qp /tmp/build/dist/RPMS/noarch/*.rpm
+                                """
+                            ).trim()
+                        }
+
+                    } catch(Exception ex) {
+                        println ex
+                        throw ex
+                    }
+                }
+
+            }
+            // Post can be used both on individual stages and for the entire build.
+            post {
+                success {
+                    echo "\u001B[32mRPM Upload Complete -\u001B[m \u2705"
+                    sendNotifications(
+                        'SUCCESS',
+                        "${slack_channel}",
+                        "\n*Build Successful!*\nservice: ${service} build: `${build}`\n author: @${author}:beers:"
+                    )
+                }
+                failure {
+                    echo "\u001B[31mRPM Upload FAILED -\u001B[m \u274C"
+                    sendNotifications(
+                        'FAILURE',
+                        "${slack_channel}",
+                        "\n*RPM BUILD & UPLOAD FAILED*\nservice: ${service} build: `${build}`\n author: @${author}\n:boom:"
+                    )
+                }
+            }
+        }
+
+    }
+
+    post {
+        // Always runs. And it runs before any of the other post conditions.
+        always {
+          // Let's wipe out the workspace before we finish!
+          echo "\u001B[35mComplete! Cleaning up workspace..\u001B[m"
+          deleteDir()
+        }
+    }
+}
+
+
+@NonCPS
+def parse_payload(json_string) {
+    return readJSON(text: json_string)
+}
+
+def check_for_tag(payloadObj) {
+    return payloadObj.ref.contains('tag')
+}

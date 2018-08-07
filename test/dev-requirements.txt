@@ -1,0 +1,12 @@
+zeep
+falcon
+python-dateutil<2.7.0
+webargs
+marshmallow
+python-gd-applogger
+webtest
+coverage
+mock
+nose
+boto3
+requests
